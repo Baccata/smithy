@@ -15,6 +15,9 @@
 
 package software.amazon.smithy.build.model;
 
+import java.io.File;
+import java.io.IOException;
+import java.net.MalformedURLException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
@@ -23,6 +26,12 @@ import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+
+import coursierapi.Dependency;
+import coursierapi.MavenRepository;
+import coursierapi.Module;
+import coursierapi.Repository;
+import coursierapi.error.CoursierError;
 import software.amazon.smithy.build.SmithyBuildException;
 import software.amazon.smithy.model.SourceLocation;
 import software.amazon.smithy.model.loader.ModelSyntaxException;
@@ -40,113 +49,140 @@ import software.amazon.smithy.utils.Pair;
  */
 final class ConfigLoader {
 
-    private ConfigLoader() {}
+  private ConfigLoader() {
+  }
 
-    static SmithyBuildConfig load(Path path) {
-        try {
-            String content = IoUtils.readUtf8File(path);
-            Path baseImportPath = path.getParent();
-            if (baseImportPath == null) {
-                baseImportPath = Paths.get(".");
-            }
-            return load(baseImportPath, loadWithJson(path, content).expectObjectNode());
-        } catch (ModelSyntaxException e) {
-            throw new SmithyBuildException(e);
-        }
+  static SmithyBuildConfig load(Path path) {
+    try {
+      String content = IoUtils.readUtf8File(path);
+      Path baseImportPath = path.getParent();
+      if (baseImportPath == null) {
+        baseImportPath = Paths.get(".");
+      }
+      return load(baseImportPath, loadWithJson(path, content).expectObjectNode());
+    } catch (ModelSyntaxException e) {
+      throw new SmithyBuildException(e);
+    }
+  }
+
+  private static Node loadWithJson(Path path, String contents) {
+    return Node.parseJsonWithComments(contents, path.toString()).accept(new VariableExpander());
+  }
+
+  private static SmithyBuildConfig load(Path baseImportPath, ObjectNode node) {
+    NodeMapper mapper = new NodeMapper();
+    return resolveImports(baseImportPath, mapper.deserialize(node, SmithyBuildConfig.class));
+  }
+
+  private static Dependency parseDependency(String depString) {
+    // The scala version is unimportant.
+    return Dependency.parse(depString, coursierapi.ScalaVersion.of("3.0.0"));
+  }
+
+  private static String urlString(File file) {
+    try {
+      return file.toURI().toURL().toString();
+    } catch (MalformedURLException e) {
+      throw new SmithyBuildException(e);
+    }
+  }
+
+  private static SmithyBuildConfig resolveImports(Path baseImportPath, SmithyBuildConfig config) {
+    List<String> imports = config.getImports().stream().map(importPath -> baseImportPath.resolve(importPath).toString())
+        .collect(Collectors.toList());
+
+    List<Repository> repositories = config.getMavenRepositories().stream().map(repoPath -> MavenRepository.of(repoPath))
+        .collect(Collectors.toList());
+
+    repositories.addAll(Repository.defaults());
+
+    List<Dependency> dependencies = config.getMavenImports().stream().map(mavenImport -> parseDependency(mavenImport))
+        .collect(Collectors.toList());
+
+    try {
+      List<String> fetchedDependencies = coursierapi.Fetch.create()
+          .addRepositories(repositories.toArray(new Repository[repositories.size()]))
+          .addDependencies(dependencies.toArray(new Dependency[dependencies.size()])).fetch().stream()
+          .map(file -> urlString(file)).collect(Collectors.toList());
+
+      Map<String, ProjectionConfig> projections = config.getProjections().entrySet().stream()
+          .map(entry -> Pair.of(entry.getKey(), resolveProjectionImports(baseImportPath, entry.getValue())))
+          .collect(Collectors.toMap(Pair::getKey, Pair::getValue));
+
+      return config.toBuilder().imports(imports).mavenImports(fetchedDependencies).projections(projections).build();
+    } catch (CoursierError e) {
+      throw new SmithyBuildException(e);
+    }
+  }
+
+  private static ProjectionConfig resolveProjectionImports(Path baseImportPath, ProjectionConfig config) {
+    List<String> imports = config.getImports().stream().map(importPath -> baseImportPath.resolve(importPath).toString())
+        .collect(Collectors.toList());
+    return config.toBuilder().imports(imports).build();
+  }
+
+  /**
+   * Expands ${NAME} values inside of strings to a {@code System} property or an
+   * environment variable.
+   */
+  private static final class VariableExpander extends NodeVisitor.Default<Node> {
+
+    private static final Pattern INLINE = Pattern.compile("(?:^|[^\\\\])\\$\\{(.+)}");
+    private static final Pattern ESCAPED_INLINE = Pattern.compile("\\\\\\$");
+
+    @Override
+    protected Node getDefault(Node node) {
+      return node;
     }
 
-    private static Node loadWithJson(Path path, String contents) {
-        return Node.parseJsonWithComments(contents, path.toString()).accept(new VariableExpander());
+    @Override
+    public Node arrayNode(ArrayNode node) {
+      return node.getElements().stream().map(element -> element.accept(this)).collect(ArrayNode.collect());
     }
 
-    private static SmithyBuildConfig load(Path baseImportPath, ObjectNode node) {
-        NodeMapper mapper = new NodeMapper();
-        return resolveImports(baseImportPath, mapper.deserialize(node, SmithyBuildConfig.class));
+    @Override
+    public Node objectNode(ObjectNode node) {
+      return node.getMembers().entrySet().stream()
+          .map(entry -> Pair.of(entry.getKey().accept(this), entry.getValue().accept(this)))
+          .collect(ObjectNode.collect(pair -> pair.getLeft().expectStringNode(), Pair::getRight));
     }
 
-    private static SmithyBuildConfig resolveImports(Path baseImportPath, SmithyBuildConfig config) {
-        List<String> imports = config.getImports().stream()
-                .map(importPath -> baseImportPath.resolve(importPath).toString())
-                .collect(Collectors.toList());
+    @Override
+    public Node stringNode(StringNode node) {
+      Matcher matcher = INLINE.matcher(node.getValue());
+      StringBuffer builder = new StringBuffer();
 
-        Map<String, ProjectionConfig> projections = config.getProjections().entrySet().stream()
-                .map(entry -> Pair.of(entry.getKey(), resolveProjectionImports(baseImportPath, entry.getValue())))
-                .collect(Collectors.toMap(Pair::getKey, Pair::getValue));
+      while (matcher.find()) {
+        String variable = matcher.group(1);
+        String replacement = expand(node.getSourceLocation(), variable);
+        // INLINE over-matches to allow for escaping. If the over-matched first group
+        // does not start with
+        // '${', we need to prepend the first character from that group on the
+        // replacement.
+        if (!matcher.group(0).startsWith("${")) {
+          replacement = matcher.group(0).charAt(0) + replacement;
+        }
+        matcher.appendReplacement(builder, replacement);
+      }
 
-        return config.toBuilder()
-                .imports(imports)
-                .projections(projections)
-                .build();
+      matcher.appendTail(builder);
+
+      // Remove escaped variables.
+      String result = ESCAPED_INLINE.matcher(builder.toString()).replaceAll("\\$");
+
+      return new StringNode(result, node.getSourceLocation());
     }
 
-    private static ProjectionConfig resolveProjectionImports(Path baseImportPath, ProjectionConfig config) {
-        List<String> imports = config.getImports().stream()
-                .map(importPath -> baseImportPath.resolve(importPath).toString())
-                .collect(Collectors.toList());
-        return config.toBuilder().imports(imports).build();
+    private static String expand(SourceLocation sourceLocation, String variable) {
+      String replacement = Optional.ofNullable(System.getProperty(variable)).orElseGet(() -> System.getenv(variable));
+
+      if (replacement == null) {
+        throw new SmithyBuildException(String.format(
+            "Unable to expand variable `" + variable + "` to an environment variable or system " + "property: %s",
+            sourceLocation));
+      }
+
+      return replacement;
     }
-
-    /**
-     * Expands ${NAME} values inside of strings to a {@code System} property
-     * or an environment variable.
-     */
-    private static final class VariableExpander extends NodeVisitor.Default<Node> {
-
-        private static final Pattern INLINE = Pattern.compile("(?:^|[^\\\\])\\$\\{(.+)}");
-        private static final Pattern ESCAPED_INLINE = Pattern.compile("\\\\\\$");
-
-        @Override
-        protected Node getDefault(Node node) {
-            return node;
-        }
-
-        @Override
-        public Node arrayNode(ArrayNode node) {
-            return node.getElements().stream().map(element -> element.accept(this)).collect(ArrayNode.collect());
-        }
-
-        @Override
-        public Node objectNode(ObjectNode node) {
-            return node.getMembers().entrySet().stream()
-                    .map(entry -> Pair.of(entry.getKey().accept(this), entry.getValue().accept(this)))
-                    .collect(ObjectNode.collect(pair -> pair.getLeft().expectStringNode(), Pair::getRight));
-        }
-
-        @Override
-        public Node stringNode(StringNode node) {
-            Matcher matcher = INLINE.matcher(node.getValue());
-            StringBuffer builder = new StringBuffer();
-
-            while (matcher.find()) {
-                String variable = matcher.group(1);
-                String replacement = expand(node.getSourceLocation(), variable);
-                // INLINE over-matches to allow for escaping. If the over-matched first group does not start with
-                // '${', we need to prepend the first character from that group on the replacement.
-                if (!matcher.group(0).startsWith("${")) {
-                    replacement = matcher.group(0).charAt(0) + replacement;
-                }
-                matcher.appendReplacement(builder, replacement);
-            }
-
-            matcher.appendTail(builder);
-
-            // Remove escaped variables.
-            String result = ESCAPED_INLINE.matcher(builder.toString()).replaceAll("\\$");
-
-            return new StringNode(result, node.getSourceLocation());
-        }
-
-        private static String expand(SourceLocation sourceLocation, String variable) {
-            String replacement = Optional.ofNullable(System.getProperty(variable))
-                    .orElseGet(() -> System.getenv(variable));
-
-            if (replacement == null) {
-                throw new SmithyBuildException(String.format(
-                        "Unable to expand variable `" + variable + "` to an environment variable or system "
-                        + "property: %s", sourceLocation));
-            }
-
-            return replacement;
-        }
-    }
+  }
 }
